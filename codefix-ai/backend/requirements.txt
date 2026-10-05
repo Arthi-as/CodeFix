@@ -1,0 +1,20 @@
+fastapi==0.109.0
+uvicorn==0.27.0
+pydantic==2.5.3
+
+# CodeT5 / transformers
+transformers==4.36.2
+torch==2.1.2
+sentencepiece==0.1.99
+tokenizers==0.15.2
+
+# torch 2.1.x is compiled against the NumPy 1.x C ABI.
+# NumPy 2.x raises "A module that was compiled using NumPy 1.x cannot be run"
+# on import of torch. Pin to <2.
+numpy<2
+
+# Static analysis
+pylint==3.0.4
+astroid==3.0.3
+
+python-multipart==0.0.6
