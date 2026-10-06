@@ -27,6 +27,7 @@ reachable, and a fork bomb or a hung loop takes the API down with it.
 from __future__ import annotations
 
 import ast
+import difflib
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -59,6 +60,7 @@ class ValidationReport:
     compiles: bool = False
     changed: bool = False
     issue_resolved: Optional[bool] = None
+    local: Optional[bool] = None
     reason: str = ""
     warnings: List[str] = field(default_factory=list)
 
@@ -69,6 +71,7 @@ class ValidationReport:
             "compiles": self.compiles,
             "changed": self.changed,
             "issue_resolved": self.issue_resolved,
+            "local": self.local,
             "reason": self.reason,
             "warnings": self.warnings,
         }
@@ -210,6 +213,73 @@ def original_issue_gone(code: str, analysis: Dict[str, Any], *, trusted: bool = 
     return True
 
 
+def changed_line_numbers(original: str, corrected: str) -> List[int]:
+    """1-based line numbers of the original that the candidate changed."""
+    before = original.splitlines()
+    after = corrected.splitlines()
+    changed: List[int] = []
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        span = list(range(i1 + 1, max(i2, i1 + 1) + 1))
+        if not span:
+            # A pure insertion or truncation changes no original line, but it
+            # still changes the program; charge the line it happened next to.
+            span = [max(1, min(i1 + 1, len(before)))]
+        changed.extend(span)
+    return sorted(set(changed))
+
+
+# A rewrite that touches three lines next to the error is a fix. One that
+# rewrites the file is a different program, whatever the gates say about it.
+MAX_UNTRUSTED_CHANGED_LINES = 3
+UNTRUSTED_LINE_RADIUS = 2
+
+
+def rewrite_is_local(
+    original: str, corrected: str, line: Optional[int]
+) -> Optional[str]:
+    """``None`` when the candidate stays near the reported line, else a reason.
+
+    This is the gate that matters most for model output. Every mechanical check
+    can be passed by a rewrite that is simply not the same program: asked to fix
+    ``print(age)`` the previous checkpoint returned ``print(sys.argv[1])``, which
+    parses, compiles, has no findings and changes one line. Only the distance
+    from the reported line gives that away.
+    """
+    before = original.splitlines()
+    after = corrected.splitlines()
+    if len(after) != len(before):
+        # Editing a line is a fix. Adding or removing one is a different program,
+        # and the commonest form of it is the model inventing the value it says
+        # is missing (`print(age)` -> `age = 10`).
+        return (
+            f"The corrected code has {len(after)} lines instead of {len(before)}, "
+            "so it adds or removes code rather than repairing the reported line."
+        )
+
+    changed = changed_line_numbers(original, corrected)
+    if not changed:
+        return "The corrected code is identical to the original."
+
+    if len(changed) > MAX_UNTRUSTED_CHANGED_LINES:
+        return (
+            f"The corrected code rewrites {len(changed)} lines (line"
+            f"{'' if len(changed) == 1 else 's'} {', '.join(str(n) for n in changed[:6])}), "
+            "which is a different program rather than a fix."
+        )
+    if line is None:
+        return None
+    far = [n for n in changed if abs(n - line) > UNTRUSTED_LINE_RADIUS]
+    if far:
+        return (
+            f"The corrected code changes line {', '.join(str(n) for n in far)}, "
+            f"which is nowhere near the reported line {line}."
+        )
+    return None
+
+
 def validate_correction(
     original: str,
     corrected: str,
@@ -248,6 +318,13 @@ def validate_correction(
         return report
 
     report.warnings = collect_warnings(corrected)
+
+    if not trusted:
+        problem = rewrite_is_local(original, corrected, analysis.get("line"))
+        report.local = problem is None
+        if problem:
+            report.reason = problem
+            return report
 
     resolved = original_issue_gone(corrected, analysis, trusted=trusted)
     report.issue_resolved = resolved

@@ -2,12 +2,14 @@
 
 Pipeline for ``POST /analyze``:
 
-    code -> static analysis -> candidate correction -> CodeT5 (advisory)
+    code -> static analysis -> deterministic correction -> local model (advisory)
           -> validation -> structured result
 
-Static analysis is the only source of truth for *what* is wrong and *where*.
-CodeT5 may improve the wording or offer an alternative patch, and the
-validator has the final say on whether anything may be called a fix.
+Static analysis is the only source of truth for *what* is wrong and *where*, and
+the deterministic correctors in :mod:`fixes` come first because they are edits
+rather than generations. The local model in :mod:`rewrite_model` may improve the
+wording or offer an alternative patch, and the validator has the final say on
+whether anything may be called a fix.
 """
 
 from __future__ import annotations
@@ -20,15 +22,15 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-import codet5
-from analyzer import MAX_CODE_CHARS, analyze_code
+import rewrite_model
+from analyzer import MAX_CODE_CHARS, analyze_code, find_issues
 from explain import build_explanation, split_explanation
 from fixes import diff_summary, propose_fix
 from validator import ValidationReport, validate_correction, validate_code
@@ -75,9 +77,9 @@ async def lifespan(app: FastAPI):
     app.state.model_ready = False
 
     async def _warm() -> None:
-        status = await run_in_threadpool(codet5.warm_up)
+        status = await run_in_threadpool(rewrite_model.warm_up)
         app.state.model_ready = bool(status.get("loaded"))
-        logger.info("CodeT5 warm-up finished: %s", status)
+        logger.info("rewrite model warm-up finished: %s", status)
 
     # Load in the background so the server accepts traffic immediately.
     task = asyncio.create_task(_warm())
@@ -181,6 +183,109 @@ class AnalyzeResponse(BaseModel):
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# deterministic fixing
+# --------------------------------------------------------------------------
+
+# Enough rounds for "one bug per line" pasted code without looping on a fixer
+# that oscillates.
+MAX_FIX_ROUNDS = 5
+
+# Findings a deterministic fixer knows how to handle. Used only as a cheap
+# pre-filter before building a context for the other findings.
+_FIXABLE_TYPES = {
+    "TypeError",
+    "SingletonComparison",
+    "unused-import",
+    "unused-variable",
+    "undefined-variable",
+}
+
+
+def _promotable_context(code: str, analysis: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The highest ranked *other* finding that has a deterministic fix.
+
+    Reporting "nothing to offer" while a one-line unused import sits in the same
+    file is what makes the tool look broken on code it was not written for, so a
+    fixable finding is allowed to become the headline. The finding it replaced
+    stays in ``all_issues``, which the panel already lists.
+    """
+    try:
+        issues = find_issues(code)
+    except Exception:
+        return None
+
+    for issue in issues[1:]:
+        if issue.error_type not in _FIXABLE_TYPES:
+            continue
+        context = {**analysis, **issue.to_dict(), "meta": dict(issue.meta)}
+        if propose_fix(code, context) is not None:
+            return context
+    return None
+
+
+def _best_static_fix(
+    code: str, analysis: Dict[str, Any]
+) -> Optional[Tuple[Dict[str, Any], str, List[str], ValidationReport]]:
+    """Fix ``code`` deterministically, or return ``None`` if nothing is safe.
+
+    Returns the (possibly promoted) analysis, the corrected source, one summary
+    per applied edit and the validation report for the final result.
+    """
+    context = analysis
+    outcome = propose_fix(code, context)
+    if outcome is None:
+        promoted = _promotable_context(code, analysis)
+        if promoted is None:
+            return None
+        context = promoted
+        outcome = propose_fix(code, context)
+        if outcome is None:
+            return None
+
+    corrected = outcome.code
+    summaries = [outcome.summary]
+    report = validate_correction(code, corrected, context, trusted=True)
+    if not report.validated:
+        return None
+
+    # Keep going while the same kind of finding is still there. Two comparisons
+    # of one input() are two findings; fixing only the first and calling the
+    # result validated is how "it worked on the demo" stops being true.
+    repeated = sum(
+        1
+        for issue in (context.get("all_issues") or [])
+        if issue.get("error_type") == context.get("error_type")
+    )
+    while repeated > 1 and len(summaries) < MAX_FIX_ROUNDS:
+        round_analysis = analyze_code(corrected)
+        if not round_analysis.get("has_error"):
+            break
+        outcome = propose_fix(corrected, round_analysis)
+        if outcome is None or outcome.code == corrected:
+            break
+        round_report = validate_correction(
+            corrected, outcome.code, round_analysis, trusted=True
+        )
+        if not round_report.validated:
+            break
+        corrected = outcome.code
+        summaries.append(outcome.summary)
+        repeated = sum(
+            1
+            for issue in (round_analysis.get("all_issues") or [])
+            if issue.get("error_type") == round_analysis.get("error_type")
+        )
+
+    if len(summaries) > 1:
+        # Re-check the accumulated result against the originally reported finding.
+        report = validate_correction(code, corrected, context, trusted=True)
+        if not report.validated:
+            return None
+
+    return context, corrected, summaries, report
+
+
 def run_pipeline(code: str) -> Dict[str, Any]:
     """Blocking analysis pipeline. Runs in a worker thread."""
     started = time.perf_counter()
@@ -205,61 +310,55 @@ def run_pipeline(code: str) -> Dict[str, Any]:
             "analysis_ms": int((time.perf_counter() - started) * 1000),
         }
 
-    # 1. Deterministic explanation, optionally enriched by CodeT5.
-    parts = split_explanation(analysis)
-    explanation = build_explanation(analysis)
-    explanation_source = "static-analysis"
-
-    model_explanation = codet5.explain_with_codet5(code, analysis)
-    if model_explanation:
-        explanation = f"{explanation} CodeT5 adds: {model_explanation}"
-        explanation_source = "codet5"
-
-    # 2. Candidate corrections, cheapest and most reliable first.
-    # The static fixer is exact, so when it validates there is no reason to
-    # spend seconds asking the model for an alternative.
-    candidates: List[Dict[str, Any]] = []
-
-    static_fix = propose_fix(code, analysis)
-    if static_fix is not None:
-        candidates.append(
-            {"code": static_fix.code, "source": "static-analysis", "summary": static_fix.summary}
-        )
-
+    # 1. Deterministic fix first: it decides *which* finding is reported, because
+    #    a finding nobody can fix is a worse headline than one we can correct.
     chosen: Optional[Dict[str, Any]] = None
     rejected: List[Dict[str, Any]] = []
     validation: Dict[str, Any] = {}
 
-    for candidate in candidates:
-        # A rewrite from the language model has to clear a stricter gate than a
-        # deterministic edit: it must not introduce findings the original did
-        # not have, or silence one message while leaving the same bug.
-        report = validate_correction(
-            code,
-            candidate["code"],
-            analysis,
-            trusted=candidate["source"] == "static-analysis",
-        )
-        if report.validated:
-            chosen = candidate
-            validation = report.to_dict()
-            break
-        rejected.append({"candidate": candidate, "report": report})
-        logger.info("rejected %s candidate: %s", candidate["source"], report.reason)
+    static = _best_static_fix(code, analysis)
+    if static is not None:
+        promoted, fixed_code, summaries, report = static
+        demoted = analysis if promoted is not analysis else None
+        chosen = {
+            "code": fixed_code,
+            "source": "static-analysis",
+            "summary": " ".join(summaries),
+        }
+        if demoted is not None:
+            # Say out loud what was *not* fixed, so a promoted fix never reads as
+            # "your code is clean now". The demoted finding also stays at the top
+            # of all_issues, which the panel lists.
+            chosen["summary"] = (
+                f"{chosen['summary']} The finding on line {demoted['line']} "
+                f"({demoted['error_type']}) has no safe automatic correction and is still open."
+            )
+            analysis = promoted
+        validation = report.to_dict()
 
+    # 2. Deterministic explanation, optionally enriched by the model.
+    parts = split_explanation(analysis)
+    explanation = build_explanation(analysis)
+    explanation_source = "static-analysis"
+
+    model_explanation = rewrite_model.explain_with_model(code, analysis)
+    if model_explanation:
+        explanation = f"{explanation} Model adds: {model_explanation}"
+        explanation_source = "local-llm"
+
+    # 3. Nothing deterministic worked, so it is worth asking the model.
     if chosen is None:
-        # Only now is it worth asking the model.
-        model_fix = codet5.propose_codet5_correction(code, analysis)
+        model_fix = rewrite_model.propose_model_fix(code, analysis)
         if model_fix:
             report = validate_correction(code, model_fix, analysis, trusted=False)
             if report.validated:
-                chosen = {"code": model_fix, "source": "codet5", "summary": "Proposed by CodeT5."}
+                chosen = {"code": model_fix, "source": "local-llm", "summary": "Rewritten by the local model."}
                 validation = report.to_dict()
             else:
                 rejected.append(
-                    {"candidate": {"code": model_fix, "source": "codet5"}, "report": report}
+                    {"candidate": {"code": model_fix, "source": "local-llm"}, "report": report}
                 )
-                logger.info("rejected codet5 candidate: %s", report.reason)
+                logger.info("rejected model candidate: %s", report.reason)
 
     validated = chosen is not None
     corrected_code = chosen["code"] if chosen else code
@@ -267,13 +366,14 @@ def run_pipeline(code: str) -> Dict[str, Any]:
     if not validated:
         # Show the best near-miss, clearly marked as not a fix. A deterministic
         # edit that parses but does not clear the finding is still informative;
-        # model output is shown only when it did clear it, because a fragment
-        # that merely parses (`print(age)` -> `defprint(name)`) is worse than
-        # nothing to copy.
+        # model output is shown only when it both stayed near the reported line
+        # and cleared the finding, because a fragment that merely parses
+        # (`print(age)` -> `defprint(name)`) is worse than nothing to copy.
         for entry in rejected:
             report = entry["report"]
-            if entry["candidate"]["source"] == "codet5" and report.issue_resolved is False:
-                continue
+            if entry["candidate"]["source"] != "static-analysis":
+                if not report.local or report.issue_resolved is False:
+                    continue
             if report.syntax_valid and report.compiles:
                 corrected_code = entry["candidate"]["code"]
                 validation = report.to_dict()
@@ -303,7 +403,7 @@ def run_pipeline(code: str) -> Dict[str, Any]:
 
 
 def _ai_metadata(explanation_source: str, fix_source: Optional[str]) -> Dict[str, Any]:
-    status = codet5.model_status()
+    status = rewrite_model.model_status()
     return {
         "model": status["model"],
         "model_loaded": status["loaded"],
@@ -312,7 +412,8 @@ def _ai_metadata(explanation_source: str, fix_source: Optional[str]) -> Dict[str
         "explanation_source": explanation_source,
         "fix_source": fix_source,
         "note": (
-            "Static analysis determines the error type, line and severity. CodeT5 is advisory: "
+            "Static analysis determines the error type, line and severity, and the "
+            "deterministic correctors are tried first. The local model is advisory: "
             "its output is only used when it passes validation."
         ),
     }
@@ -343,7 +444,7 @@ async def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "version": API_VERSION,
-        "model": codet5.model_status(),
+        "model": rewrite_model.model_status(),
     }
 
 

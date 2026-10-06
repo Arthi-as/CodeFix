@@ -177,10 +177,13 @@ UNTRUSTED = [
         False,
     ),
     (
-        "model output that removes the finding without adding anything",
+        # Inventing the missing value is not repairing the reported line. The
+        # rewrite model is never asked for `undefined-variable` in the first
+        # place, but the gate has to hold if that policy ever changes.
+        "model output that invents a value for the missing name",
         "print(age)\n",
         "age = 10\nprint(age)\n",
-        True,
+        False,
     ),
 ]
 
@@ -194,6 +197,48 @@ for label, code, candidate, expected in UNTRUSTED:
     else:
         print(f"ok    {label}  (validated={report.validated})")
 
+
+# Passing every static gate is still not enough: the candidate has to be the same
+# program with the reported line repaired. Asked to fix `print(age)` the previous
+# checkpoint answered `print(sys.argv[1])` -- one line changed, parses, compiles,
+# and `sys` is not imported, so only the distance from the reported line gives
+# the substitution away.
+LOCALITY = [
+    (
+        "rewrites the whole file instead of the reported line",
+        "import os\nimport sys\nprint(toatl)\n",
+        "import sys\nprint(total)\n",
+        False,
+    ),
+    (
+        "edits a line far from the reported error",
+        "a = 1\nb = 2\nc = 3\nd = 4\ne = 5\nf = 6\ng = 7\nh = 8\ni = 9\nprint(a + nope)\n",
+        "a = 1\nb = 2\nc = 4\nd = 4\ne = 5\nf = 6\ng = 7\nh = 8\ni = 9\nprint(a + nope)\n",
+        False,
+    ),
+    (
+        "repairs the reported line and stays local",
+        "name = 'Ada'\nage = 36\nprint(name + ' is ' + age)\n",
+        "name = 'Ada'\nage = 36\nprint(name + ' is ' + str(age))\n",
+        True,
+    ),
+]
+
+print()
+for label, code, candidate, expected in LOCALITY:
+    analysis = analyze_code(code)
+    report = validate_correction(code, candidate, analysis, trusted=False)
+    if report.local is None:
+        failures += 1
+        print(f"FAIL  {label}: locality was not reported")
+    elif report.validated is not expected or report.local is not expected:
+        failures += 1
+        print(
+            f"FAIL  {label}: validated={report.validated} local={report.local} "
+            f"(want {expected}): {report.reason}"
+        )
+    else:
+        print(f"ok    {label}  (validated={report.validated}, local={report.local})")
 
 print()
 print("FAILURES:", failures)

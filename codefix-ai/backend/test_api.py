@@ -32,7 +32,7 @@ def start_server(port: int) -> tuple[subprocess.Popen, object]:
     the server blocks on write and requests hang.
     """
     env = dict(os.environ)
-    env["CODEFIX_ENABLE_CODET5"] = "1"
+    env["CODEFIX_ENABLE_MODEL"] = "1"
     log = open(os.path.join(HERE, "server_test.log"), "w", encoding="utf-8")
     process = subprocess.Popen(
         [PYTHON, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],

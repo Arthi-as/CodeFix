@@ -1,9 +1,9 @@
 """Deterministic explanations.
 
-These are the fallback wording used when CodeT5 is unavailable or its output
-fails the quality gates in :mod:`codet5`. They are derived entirely from the
-static finding, so they are always specific to the reported line and never
-invent a cause.
+These are the fallback wording used when the local model is unavailable or its
+output fails the quality gates in :mod:`rewrite_model`. They are derived entirely
+from the static finding, so they are always specific to the reported line and
+never invent a cause.
 """
 
 from __future__ import annotations

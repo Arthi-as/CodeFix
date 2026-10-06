@@ -426,7 +426,7 @@ class PythonAnalyzer:
                     message=exc.msg or str(exc),
                     suggestion=self._syntax_suggestion(exc, code),
                     layer="syntax",
-                    meta={"syntax_msg": exc.msg or ""},
+                    meta={"syntax_msg": exc.msg or "", "offset": exc.offset},
                 )
             ]
         except (ValueError, MemoryError, RecursionError) as exc:
@@ -652,6 +652,17 @@ class PythonAnalyzer:
                     hint = f'Use an f-string: f"{{{ast.unparse(node.left)}}}{template}".'
                 else:
                     hint = "Use an f-string to embed the number in the text, e.g. f\"value: {x}\"."
+                # A concrete rewrite is only possible when one side is a plain
+                # string literal; otherwise the f-string is only a hint.
+                meta: Dict[str, Any] = {"binop": "str-plus-number"}
+                left_literal = isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
+                right_literal = isinstance(node.right, ast.Constant) and isinstance(node.right.value, str)
+                if left_literal or right_literal:
+                    literal = node.left if left_literal else node.right
+                    other = node.right if left_literal else node.left
+                    meta["str_side"] = "left" if left_literal else "right"
+                    meta["template"] = literal.value.replace("{", "{{").replace("}", "}}")
+                    meta["expression"] = ast.unparse(other)
                 issues.append(
                     CodeIssue(
                         line=node.lineno,
@@ -667,6 +678,7 @@ class PythonAnalyzer:
                         ),
                         suggestion=hint,
                         layer="semantic",
+                        meta=meta,
                     )
                 )
         return issues

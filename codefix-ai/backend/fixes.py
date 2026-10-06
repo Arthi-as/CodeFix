@@ -107,6 +107,66 @@ def _is_singleton_literal(node: ast.AST) -> bool:
     )
 
 
+def _reproducible_number(text: str, converter: Callable[[str], Any]) -> bool:
+    """True when ``str(converter(text)) == text``, e.g. ``'1'`` for ``int``."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    try:
+        return str(converter(stripped)) == stripped
+    except ValueError:
+        return False
+
+
+def _string_only_use(
+    node: ast.AST, name: str, reported_line: Optional[int], converter: Callable[[str], Any]
+) -> bool:
+    """True when ``name`` is used somewhere that only makes sense as a ``str``.
+
+    Wrapping ``choice = input('1/2/3? ')`` in ``int()`` fixes ``choice > 2`` and
+    silently breaks ``choice == 'y'`` three lines above, so the conversion cannot
+    be offered while such a use exists. A quoted number that the converter
+    reproduces exactly is not such a use: it is rewritten to a bare number, which
+    matches every value the quoted form matched.
+    """
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return node.value.id == name
+    if isinstance(node, ast.Compare) and reported_line is not None:
+        if node.lineno == reported_line:
+            return False  # the comparison this finding is about
+        operands = [node.left, *node.comparators]
+        for i, operand in enumerate(operands):
+            if not (isinstance(operand, ast.Name) and operand.id == name):
+                continue
+            for other in operands[:i] + operands[i + 1 :]:
+                if not (isinstance(other, ast.Constant) and isinstance(other.value, str)):
+                    continue
+                if not _reproducible_number(other.value, converter):
+                    return True
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        if isinstance(node.left, ast.Name) and node.left.id == name:
+            return isinstance(node.right, ast.Constant) and isinstance(node.right.value, str)
+        if isinstance(node.right, ast.Name) and node.right.id == name:
+            return isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
+    return False
+
+
+def _numeric_literal_to_rewrite(
+    node: ast.AST, name: str, converter: Callable[[str], Any]
+) -> Optional[ast.Constant]:
+    """A quoted number compared to ``name`` that ``converter`` reproduces exactly."""
+    if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+        return None
+    if not _reproducible_number(node.value, converter):
+        return None
+    parent = getattr(node, "parent", None)
+    if not isinstance(parent, ast.Compare) or node not in parent.comparators:
+        return None
+    if not (isinstance(parent.left, ast.Name) and parent.left.id == name):
+        return None
+    return node
+
+
 def _fix_input_type_mismatch(
     code: str, tree: Optional[ast.AST], meta: Dict[str, Any], outcome: FixOutcome
 ) -> Optional[str]:
@@ -124,6 +184,7 @@ def _fix_input_type_mismatch(
     # Bind input() calls to the assignment that feeds them, so the fix touches
     # the binding of `var` rather than the first input() in the file.
     targets: List[ast.Call] = []
+    rewrites: List[Tuple[ast.expr, str]] = []
     if var is None:
         # The reported line holds `input(...)` inline, so only a call inside the
         # reported expression is part of this finding. Converting every input()
@@ -137,33 +198,62 @@ def _fix_input_type_mismatch(
             and reported_line <= node.lineno <= (reported_end or reported_line)
         ]
     else:
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                child.parent = parent  # type: ignore[attr-defined]
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and _is_input_call(node.value):
                 if any(isinstance(t, ast.Name) and t.id == var for t in node.targets):
                     targets.append(node.value)
+        # Refuse rather than change what the variable means. The one recoverable
+        # case is a quoted number compared to the same variable, which is
+        # rewritten alongside the conversion.
+        converter = float if convert_to == "float" else int
+        for node in ast.walk(tree):
+            if _string_only_use(node, var, reported_line, converter):
+                return None
+            literal = _numeric_literal_to_rewrite(node, var, converter)
+            if literal is not None:
+                rewrites.append((literal, literal.value.strip()))
 
     if not targets:
         return None
 
-    rewritten = code
-    changed = False
-    # Bottom-up so earlier offsets remain valid while splicing.
-    for call in sorted(targets, key=lambda n: (n.lineno, n.col_offset), reverse=True):
+    edits: List[Tuple[Tuple[Tuple[int, int], Tuple[int, int]], str]] = []
+    for call in targets:
         source = ast.get_source_segment(code, call)
         if not source or _is_already_converted(source):
             continue
-        candidate = _splice(rewritten, _span(call)[0], _span(call)[1], f"{convert_to}({source})")
+        edits.append((_span(call), f"{convert_to}({source})"))
+    for literal, number in rewrites:
+        edits.append((_span(literal), number))
+
+    if not edits:
+        return None
+
+    # Bottom-up so earlier offsets remain valid while splicing.
+    rewritten = code
+    for (start, end), replacement in sorted(edits, key=lambda e: e[0], reverse=True):
+        candidate = _splice(rewritten, start, end, replacement)
         if candidate == rewritten:
             continue
         rewritten = candidate
-        changed = True
 
-    if not changed:
+    if rewritten == code:
         return None
+
+    quoted = sorted({number for _, number in rewrites})
+    if not quoted:
+        rewrites_note = ""
+    elif len(quoted) == 1:
+        rewrites_note = f" and compared it with the number {quoted[0]} instead of a quoted string"
+    else:
+        rewrites_note = f" and compared it with the numbers {', '.join(quoted)} instead of quoted strings"
 
     outcome.applied = "input-type-mismatch"
     outcome.summary = (
-        f"Wrapped the input in `{convert_to}()` so the comparison with a number is valid."
+        f"Wrapped the input in `{convert_to}()` so the comparison with a number is valid"
+        f"{rewrites_note}."
     )
     return rewritten
 
@@ -426,6 +516,133 @@ def _fix_syntax_expected_colon(
     )
 
 
+def _fix_str_number_concat(
+    code: str, tree: Optional[ast.AST], meta: Dict[str, Any], outcome: FixOutcome
+) -> Optional[str]:
+    """``'Age: ' + 18`` -> an f-string, which is the only reading of that code.
+
+    ``+`` cannot cross the str/number boundary, so the programmer meant to embed
+    the value in the text. ``f'text: {x}'`` and ``'text: ' + str(x)`` produce the
+    same string, so this rewrites rather than guesses.
+    """
+    if meta.get("binop") != "str-plus-number":
+        return None
+    str_side = meta.get("str_side")
+    line = meta.get("line")
+    end_line = meta.get("end_line") or line
+    if str_side not in ("left", "right") or line is None or tree is None:
+        return None
+
+    template = meta.get("template") or ""
+    expression = meta.get("expression") or ""
+    if not template or not expression:
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Add):
+            continue
+        if not line <= getattr(node, "lineno", 0) <= end_line:
+            continue
+
+        placeholder = "{" + expression + "}"
+        inner = template + placeholder if meta.get("str_side") == "left" else placeholder + template
+        # An f-string expression may not contain a backslash before Python 3.12,
+        # and the quote that delimits it may not appear in the expression.
+        replacement = None
+        if "\\" not in expression:
+            for quote in ("'", '"'):
+                if quote not in inner:
+                    replacement = "f" + quote + inner + quote
+                    break
+        if replacement is None:
+            for quote in ("'", '"'):
+                if quote in template:
+                    continue
+                left = f"{quote}{template}{quote}" if meta.get("str_side") == "left" else f"str({expression})"
+                right = f"str({expression})" if meta.get("str_side") == "left" else f"{quote}{template}{quote}"
+                replacement = f"{left} + {right}"
+                break
+        if replacement is None:
+            return None
+
+        rewritten = _splice(code, _span(node)[0], _span(node)[1], replacement)
+        if rewritten == code:
+            return None
+
+        outcome.applied = "str-number-concat"
+        outcome.summary = (
+            "Turned the `+` into an f-string, which is how a number is put into text "
+            "in Python."
+        )
+        return rewritten
+    return None
+
+
+_COMPOUND_ASSIGN_HEADS = ("!", "<", ">", "+", "-", "*", "/", "%", "&", "|", "^", "@", ":", "=")
+_CONDITION_KEYWORDS = ("if", "elif", "while", "assert")
+
+
+def _single_assignment_in_condition(body: str) -> Optional[int]:
+    """Index of the lone ``=`` in a condition, or ``None`` when it is ambiguous."""
+    stripped = body.strip()
+    keyword = stripped.split(None, 1)[0] if stripped.split(None, 1) else ""
+    if keyword not in _CONDITION_KEYWORDS:
+        return None
+
+    candidates = []
+    for index, char in enumerate(body):
+        if char != "=":
+            continue
+        if index and body[index - 1] in _COMPOUND_ASSIGN_HEADS:
+            continue
+        if index + 1 < len(body) and body[index + 1] == "=":
+            continue
+        candidates.append(index)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _fix_syntax_assignment_in_condition(
+    code: str, tree: Optional[ast.AST], meta: Dict[str, Any], outcome: FixOutcome
+) -> Optional[str]:
+    """``if x = 5:`` -> ``if x == 5:``.
+
+    CPython says "Maybe you meant '==' or ':=' instead of '='?" but points at the
+    start of the condition rather than at the character, so the line itself is
+    searched - and only when the statement is a condition and the line holds
+    exactly one candidate. The file does not parse, so the validator is what
+    confirms the result.
+    """
+    msg = (meta.get("syntax_msg") or "").lower()
+    line = meta.get("line")
+    if "maybe you meant '=='" not in msg or line is None:
+        return None
+
+    lines = code.splitlines(keepends=True)
+    if not 1 <= line <= len(lines):
+        return None
+    body = lines[line - 1].rstrip("\r\n")
+    index = _single_assignment_in_condition(body)
+    if index is None:
+        return None
+
+    rewritten = (
+        "".join(lines[: line - 1])
+        + body[:index]
+        + "=="
+        + body[index + 1 :]
+        + lines[line - 1][len(body) :]
+        + "".join(lines[line:])
+    )
+    if rewritten == code:
+        return None
+
+    outcome.applied = "assignment-in-condition"
+    outcome.summary = (
+        f"Changed the single `=` on line {line} to `==`, which is what the parser asked for."
+    )
+    return rewritten
+
+
 def _fix_syntax_missing_indent(
     code: str, tree: Optional[ast.AST], meta: Dict[str, Any], outcome: FixOutcome
 ) -> Optional[str]:
@@ -513,6 +730,11 @@ SEMANTIC_FIXERS: List[Tuple[Predicate, Fixer]] = [
         _fix_input_type_mismatch,
     ),
     (
+        lambda context: context.get("error_type") == "TypeError"
+        and context.get("binop") == "str-plus-number",
+        _fix_str_number_concat,
+    ),
+    (
         lambda context: context.get("error_type") == "SingletonComparison",
         _fix_singleton_comparison,
     ),
@@ -526,6 +748,10 @@ SYNTAX_FIXERS: List[Tuple[Predicate, Fixer]] = [
     (
         lambda context: "expected an indented block" in (context.get("syntax_msg") or "").lower(),
         _fix_syntax_missing_indent,
+    ),
+    (
+        lambda context: "maybe you meant '=='" in (context.get("syntax_msg") or "").lower(),
+        _fix_syntax_assignment_in_condition,
     ),
     (
         lambda context: "missing parentheses in call to 'print'" in (context.get("syntax_msg") or "").lower(),
