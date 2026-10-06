@@ -49,6 +49,16 @@ function severityStyle(severity) {
   return SEVERITY_COLORS[severity] || DEFAULT_SEVERITY;
 }
 
+// The three outcomes the result panel has to tell apart at a glance: a fix we
+// made ourselves, a fix the local model proposed (the user has to review it),
+// and a finding deliberately left without an automatic correction.
+const REPAIR_CHIPS = {
+  fixed: { className: 'repair-fixed', label: 'Fixed' },
+  ai_suggested: { className: 'repair-ai', label: 'AI suggested' },
+  explanation_only: { className: 'repair-none', label: 'No automatic fix' },
+  clean: { className: 'repair-clean', label: 'No issues' },
+};
+
 function App() {
   const [code, setCode] = useState(DEFAULT_CODE);
   const [analysis, setAnalysis] = useState(null);
@@ -228,6 +238,9 @@ function App() {
 
   const model = analysis?.ai;
 
+  const repair = analysis?.repair || null;
+  const repairChip = repair && REPAIR_CHIPS[repair.status] ? REPAIR_CHIPS[repair.status] : null;
+
   return (
     <div className="app">
       <header className="header">
@@ -369,6 +382,20 @@ function App() {
                   <div className="error-title">
                     <h3>Bug Found</h3>
                     <span className="error-line">Line {analysis.line}</span>
+                    {repairChip && (
+                      <span
+                        className={`model-chip repair-chip ${repairChip.className}`}
+                        title={
+                          repair.status === 'ai_suggested'
+                            ? `Review this change before applying it.${
+                                repair.reason ? ` ${repair.reason}` : ''
+                              }`
+                            : repair.reason || undefined
+                        }
+                      >
+                        {repairChip.label}
+                      </span>
+                    )}
                   </div>
                   <div
                     className={`severity-badge severity-${String(analysis.severity || '').toLowerCase()}`}
@@ -394,7 +421,7 @@ function App() {
                 </div>
 
                 <div className="analysis-section">
-                  <h4>Message</h4>
+                  <h4>Problem</h4>
                   <div className="explanation">{analysis.message}</div>
                 </div>
 
@@ -402,6 +429,16 @@ function App() {
                   <div className="analysis-section">
                     <h4>{analysis.explanation_title || 'Why?'}</h4>
                     <div className="explanation">{analysis.explanation}</div>
+                  </div>
+                )}
+
+                {analysis.repair?.status === 'explanation_only' && (
+                  <div className="analysis-section">
+                    <h4>Why no automatic fix?</h4>
+                    <div className="explanation">{analysis.repair.message}</div>
+                    {analysis.repair.reason && (
+                      <div className="validation-note">{analysis.repair.reason}</div>
+                    )}
                   </div>
                 )}
 
@@ -420,6 +457,17 @@ function App() {
                         {analysis.fix_summary}
                         {model?.fix_source && (
                           <span className="source-tag">via {model.fix_source}</span>
+                        )}
+                      </div>
+                    )}
+                    {repair && (repair.status === 'fixed' || repair.status === 'ai_suggested') && (
+                      <div className="fix-summary">
+                        <span>
+                          Line {repair.line} · {repair.edit_lines} line
+                          {repair.edit_lines === 1 ? '' : 's'} changed
+                        </span>
+                        {repair.status === 'ai_suggested' && repair.confidence != null && (
+                          <span className="source-tag">confidence {repair.confidence}</span>
                         )}
                       </div>
                     )}

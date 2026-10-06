@@ -286,6 +286,118 @@ def _best_static_fix(
     return context, corrected, summaries, report
 
 
+# --------------------------------------------------------------------------
+# repair status
+#
+# The panel needs to tell three outcomes apart without reading validation
+# internals: something was corrected (`fixed`), the model proposed the
+# correction (`ai_suggested`), or an error was found and deliberately left
+# alone (`explanation_only`).
+# --------------------------------------------------------------------------
+
+EXPLANATION_ONLY_MESSAGE = (
+    "The error was detected, but CodeFix could not safely determine the intended correction."
+)
+
+REASON_NO_CORRECTION = "No automatic correction is safe to offer for this finding."
+
+# What the *programmer* has to decide, for the finding types no automatic rule
+# may touch. Saying which decision is missing is the whole point of the
+# explanation-only state: "no fix" without this reads as "your code is fine".
+NO_FIX_REASONS = {
+    "undefined-variable": (
+        "The intended variable cannot be determined from the code alone, so no name "
+        "was substituted for it."
+    ),
+    "ZeroDivisionError": (
+        "Changing the divisor would change what the program calculates, so no divisor "
+        "was substituted for it."
+    ),
+    "IndexError": "Which index was intended cannot be determined from the code alone.",
+    "no-member": "Which attribute was intended cannot be determined from the code alone.",
+    "not-callable": "What to call instead cannot be determined from the code alone.",
+    "unsubscriptable-object": (
+        "What should be indexed instead cannot be determined from the code alone."
+    ),
+}
+
+
+def _repair_edit(original: str, corrected: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """Line number, original text and replacement text of the first change.
+
+    Most corrections replace one line; when a fix spans several (the rounds in
+    :func:`_best_static_fix`, or an import removal with nothing added) the pair
+    is ``None`` and the diff carries the detail instead.
+    """
+    rows = [row for row in diff_summary(original, corrected) if row["kind"] in ("added", "removed")]
+    removed = [row for row in rows if row["kind"] == "removed"]
+    added = [row for row in rows if row["kind"] == "added"]
+    if len(removed) == 1 and len(added) == 1:
+        if removed[0]["line"] == added[0]["line"]:
+            return removed[0]["line"], removed[0]["text"], added[0]["text"]
+        # Different numbering before and after: report the line as it stands in
+        # the corrected file, which is what the user is about to look at.
+        return added[0]["line"], removed[0]["text"], added[0]["text"]
+    if len(removed) == 1 and not added:
+        return removed[0]["line"], removed[0]["text"], None
+    if len(added) == 1 and not removed:
+        return added[0]["line"], None, added[0]["text"]
+    return None, None, None
+
+
+def _build_repair(
+    code: str,
+    corrected: str,
+    analysis: Dict[str, Any],
+    chosen: Optional[Dict[str, Any]],
+    validation: Dict[str, Any],
+    model_repair: Optional[Any] = None,
+    decline_reason: str = "",
+) -> Dict[str, Any]:
+    """The repair block the panel renders. Additive: existing keys are untouched."""
+    if chosen is None:
+        error_type = analysis.get("error_type") or ""
+        reason = validation.get("reason") or ""
+        if decline_reason and validation.get("reason") in ("", REASON_NO_CORRECTION):
+            reason = decline_reason
+        policy = NO_FIX_REASONS.get(error_type)
+        return {
+            "status": "explanation_only",
+            "line": analysis.get("line"),
+            "original": None,
+            "replacement": None,
+            "source": None,
+            "message": EXPLANATION_ONLY_MESSAGE,
+            "reason": policy or reason or EXPLANATION_ONLY_MESSAGE,
+            "confidence": None,
+            "edit_lines": validation.get("edit_lines"),
+        }
+
+    line, original, replacement = _repair_edit(code, corrected)
+    if model_repair is not None:
+        line = model_repair.line
+        original = model_repair.original
+        replacement = model_repair.replacement
+        confidence: Optional[float] = round(model_repair.confidence, 2)
+        reason = model_repair.reason or chosen["summary"]
+        status = "ai_suggested"
+    else:
+        confidence = None
+        reason = chosen["summary"]
+        status = "fixed"
+    return {
+        "status": status,
+        "line": line,
+        "original": original,
+        "replacement": replacement,
+        "source": chosen["source"],
+        "message": None,
+        "reason": reason,
+        "confidence": confidence,
+        "edit_lines": validation.get("edit_lines"),
+    }
+
+
 def run_pipeline(code: str) -> Dict[str, Any]:
     """Blocking analysis pipeline. Runs in a worker thread."""
     started = time.perf_counter()
@@ -306,6 +418,17 @@ def run_pipeline(code: str) -> Dict[str, Any]:
             "validation_details": report,
             "fix_summary": None,
             "diff": [],
+            "repair": {
+                "status": "clean",
+                "line": None,
+                "original": None,
+                "replacement": None,
+                "source": None,
+                "message": "No error was detected, so there is nothing to correct.",
+                "reason": "",
+                "confidence": None,
+                "edit_lines": None,
+            },
             "ai": _ai_metadata(explanation_source="static-analysis", fix_source=None),
             "analysis_ms": int((time.perf_counter() - started) * 1000),
         }
@@ -346,19 +469,36 @@ def run_pipeline(code: str) -> Dict[str, Any]:
         explanation = f"{explanation} Model adds: {model_explanation}"
         explanation_source = "local-llm"
 
-    # 3. Nothing deterministic worked, so it is worth asking the model.
+    # 3. Nothing deterministic worked, so it is worth asking the model for one
+    #    line to replace - never for a rewritten program.
+    model_repair = None
+    decline_reason = ""
     if chosen is None:
-        model_fix = rewrite_model.propose_model_fix(code, analysis)
-        if model_fix:
-            report = validate_correction(code, model_fix, analysis, trusted=False)
+        model_repair, decline_reason = rewrite_model.propose_local_repair(code, analysis)
+        if model_repair is not None:
+            report = validate_correction(code, model_repair.code, analysis, trusted=False)
             if report.validated:
-                chosen = {"code": model_fix, "source": "local-llm", "summary": "Rewritten by the local model."}
+                chosen = {
+                    "code": model_repair.code,
+                    "source": "local-llm",
+                    "summary": (
+                        f"Rewritten by the local model on line {model_repair.line}: "
+                        f"{model_repair.reason}"
+                        if model_repair.reason
+                        else f"Rewritten by the local model on line {model_repair.line}."
+                    ),
+                }
                 validation = report.to_dict()
             else:
                 rejected.append(
-                    {"candidate": {"code": model_fix, "source": "local-llm"}, "report": report}
+                    {
+                        "candidate": {"code": model_repair.code, "source": "local-llm"},
+                        "report": report,
+                    }
                 )
-                logger.info("rejected model candidate: %s", report.reason)
+                logger.info("rejected model repair: %s", report.reason)
+                decline_reason = report.reason or decline_reason
+                model_repair = None
 
     validated = chosen is not None
     corrected_code = chosen["code"] if chosen else code
@@ -380,7 +520,7 @@ def run_pipeline(code: str) -> Dict[str, Any]:
                 break
         if not validation:
             report = ValidationReport()
-            report.reason = "No automatic correction is safe to offer for this finding."
+            report.reason = REASON_NO_CORRECTION
             report.warnings = analysis.get("warnings", [])
             validation = report.to_dict()
 
@@ -397,6 +537,10 @@ def run_pipeline(code: str) -> Dict[str, Any]:
         "validation_details": validation,
         "fix_summary": chosen["summary"] if chosen else None,
         "diff": diff_summary(code, corrected_code) if corrected_code != code else [],
+        "repair": _build_repair(
+            code, corrected_code, analysis, chosen, validation,
+            model_repair=model_repair, decline_reason=decline_reason,
+        ),
         "ai": _ai_metadata(explanation_source, chosen["source"] if chosen else None),
         "analysis_ms": int((time.perf_counter() - started) * 1000),
     }

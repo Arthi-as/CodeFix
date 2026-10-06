@@ -1,33 +1,42 @@
-"""Local instruction-tuned rewrite model.
+"""Local instruction-tuned repair model.
 
 This module is deliberately *advisory*. It proposes; :mod:`validator` decides.
 The previous checkpoint here (``Salesforce/codet5-base``) is a pretrained
 code-completion model, not an instruction model: asked to repair a file it
 emitted unrelated code, and ``print(age)`` came back as ``defprint(name)`` - text
 that parses, compiles and silences the reported message, so every mechanical gate
-passed. An instruct-tuned checkpoint fixes most of that, but not all of it, so two
-rules keep it in its lane:
+passed. An instruct-tuned checkpoint fixes most of that, but not all of it, so
+three rules keep it in its lane:
 
 * it only sees findings whose correction is mechanical (:data:`ELIGIBLE_TYPES`),
   because a missing name, an out-of-range index or a zero divisor is a decision
   the programmer has to make, and the model answers those by inventing something;
-* every candidate it produces must clear the untrusted gates in
-  :mod:`validator` - including the locality gate, which rejects a rewrite that
-  touches lines far from the reported one.
+* it is never asked for a whole program. It is shown a window around the
+  reported line and asked for one line to replace - the rest of the file is
+  spliced back byte-for-byte by :func:`_apply_repair`, so an unrelated rewrite
+  is not something the model can express;
+* every candidate it produces must still clear the untrusted gates in
+  :mod:`validator` - syntax, no new findings, and the locality gate that rejects
+  an edit outside the reported region.
 
 ``CODEFIX_MODEL`` points at whatever checkpoint suits the machine. On CPU,
-``Qwen/Qwen2.5-Coder-0.5B-Instruct`` is roughly 2 GB and answers in 6-15 s;
-1.5B or 7B are better if there is RAM or a GPU.
+``Qwen/Qwen2.5-Coder-0.5B-Instruct`` is roughly 1 GB and answers a one-line
+repair in about 10 s; 1.5B or 7B are better if there is RAM or a GPU.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from validator import UNTRUSTED_LINE_RADIUS
+
 
 _LOG = logging.getLogger(__name__)
 
@@ -83,11 +92,52 @@ ELIGIBLE_TYPES = {
     "unused-variable",
 }
 
+# Below this the model is saying it is guessing, and a guess is not a repair.
+MIN_CONFIDENCE = float(os.environ.get("CODEFIX_MODEL_MIN_CONFIDENCE", "0.7"))
+
+# How much of the file the model is shown. The reported line sits in the
+# middle; everything outside the window is never the model's business. The
+# radius is small because the prompt is paid for twice over on CPU: prefill of
+# the window is the single biggest cost inside the request budget, and a wide
+# window buys context the model has no time to decode an answer for.
+WINDOW_RADIUS = int(os.environ.get("CODEFIX_MODEL_CONTEXT_LINES", "4"))
+MAX_REPAIR_LENGTH = 160
+
+
+@dataclass
+class LocalRepair:
+    """One line the model says should be different, with its justification."""
+
+    line: int
+    original: str
+    replacement: str
+    reason: str = ""
+    confidence: float = 0.0
+    code: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "line": self.line,
+            "original": self.original,
+            "replacement": self.replacement,
+            "reason": self.reason,
+            "confidence": round(self.confidence, 2),
+        }
+
+
 _SYSTEM_REPAIR = (
-    "You repair one Python file. Reply with the complete corrected file inside a single "
-    "```python code block. Make the smallest change that fixes the reported error and keep "
-    "every other line exactly as it is. Do not add features. No prose."
+    "Fix exactly one line of a Python file. Answer with one JSON object only:\n"
+    '{"line": 0, "confidence": 0.9, "original": "", "replacement": "", "reason": ""}\n'
+    "line = the line you replace. original = that line copied exactly as written, "
+    "not its output. replacement = the corrected line, no newline. confidence = 0.9 "
+    "when the fix follows from the error, below 0.7 when you are guessing. reason = "
+    "at most 5 words.\n"
+    "No other line may change. Never invent variables, imports or values, never "
+    "delete or comment out code, never use pass, never change a number or string "
+    "just to make the program run.\n"
+    'If it cannot be determined, answer {"no_fix": true, "reason": "why"}.'
 )
+
 
 _SYSTEM_EXPLAIN = (
     "You explain Python bugs to a beginner. Answer in two or three plain sentences. "
@@ -297,34 +347,47 @@ class LocalRewriteModel:
             return None
         return text
 
-    def propose_fix(self, code: str, analysis: Dict[str, Any]) -> Optional[str]:
-        """Model rewrite of the whole file, returned *unvalidated*.
+    def propose_repair(self, code: str, analysis: Dict[str, Any]) -> Tuple[Optional[LocalRepair], str]:
+        """Ask for one line to replace. Returns ``(repair, reason)``.
 
-        The caller must run :func:`validator.validate_correction` before showing
-        it. ``None`` means no candidate was produced, or the finding is one the
-        model is not allowed to touch.
+        ``repair`` is ``None`` whenever the answer is not usable, and ``reason``
+        says why, so the panel can show *why* nothing was offered instead of an
+        empty box. The returned candidate is still *unvalidated*: the caller
+        must run :func:`validator.validate_correction` before showing it.
         """
         if not ENABLED:
-            return None
+            return None, "the model is disabled"
         error_type = analysis.get("error_type") or ""
         if error_type not in ELIGIBLE_TYPES:
             _LOG.info("model not asked about %s: it needs a decision, not a rewrite", error_type)
-            return None
+            return None, f"{error_type} needs a decision about intent, not a rewrite"
+        line = analysis.get("line")
+        if not isinstance(line, int) or not 1 <= line <= len(code.splitlines()):
+            return None, "the reported line is not inside the file"
         if not self._within_budget(code):
-            return None
+            return None, "the file is too long to repair at CPU speed"
 
+        # The line to copy is spelled out on its own: asked to quote it from the
+        # window alone, this checkpoint quoted the line's *output* instead
+        # (`Ada is 36` for `print(name + ' is ' + age)`), which never matches.
         user = (
-            f"Fix this error.\n\nError on line {analysis.get('line')}: {error_type}\n"
+            f"Error on line {line}: {error_type}\n"
             f"{analysis.get('message') or ''}\n\n"
-            f"File:\n```python\n{code}\n```\n\n"
-            "Return the whole file with only that error fixed."
+            f"Line {line} to replace, copied as written: {code.splitlines()[line - 1]}\n\n"
+            f"File window:\n{_repair_window(code, line)}"
         )
-        candidate = _extract_code(
-            self._chat(_SYSTEM_REPAIR, user, MAX_NEW_TOKENS_FIX, FIX_TIME_BUDGET_S)
-        )
-        if not candidate.strip() or candidate.strip() == code.strip():
-            return None
-        return candidate
+        answer = self._chat(_SYSTEM_REPAIR, user, MAX_NEW_TOKENS_FIX, FIX_TIME_BUDGET_S)
+        return parse_repair_response(answer, code, analysis)
+
+    def propose_fix(self, code: str, analysis: Dict[str, Any]) -> Optional[str]:
+        """Full-file candidate from :meth:`propose_repair`, *unvalidated*.
+
+        The caller must run :func:`validator.validate_correction` before showing
+        it. Kept for callers that only need the text.
+        """
+        repair, _reason = self.propose_repair(code, analysis)
+        return repair.code if repair else None
+
 
     def _within_budget(self, code: str) -> bool:
         if len(code) > MAX_CHARS or len(code.splitlines()) > MAX_LINES:
@@ -383,6 +446,192 @@ def _extract_code(text: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def _close_truncated_json(text: str) -> Optional[str]:
+    """Closing characters for an object the answer did not finish.
+
+    The time budget cuts generation mid-object, and the fields written first
+    (line, original, replacement, confidence) are the ones already complete.
+    Completing the *syntax* invents no content: everything between the last
+    quote and the cut stays exactly as the model wrote it, and the gates in
+    :func:`parse_repair_response` still have to accept each value.
+    """
+    in_string = False
+    escaped = False
+    stack: List[str] = []
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if not stack or (char == "}" and stack[-1] != "{") or (char == "]" and stack[-1] != "["):
+                return None
+            stack.pop()
+    if escaped or (not in_string and not stack):
+        # A dangling escape would swallow the closing quote, and text with
+        # nothing left open is not truncation - it is malformed.
+        return None
+    out = text + ('"' if in_string else "")
+    out += "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+    return out
+
+
+def _extract_json_object(text: str) -> Tuple[Dict[str, Any], bool]:
+    """First JSON object in the answer.
+
+    Returns ``(object, complete)``. ``complete`` is False when the answer was
+    cut short and the object had to be closed before it would parse, which is
+    the only case where a field may be missing its ending.
+    """
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        chunk = text[index:]
+        try:
+            data, _end = decoder.raw_decode(chunk)
+        except ValueError:
+            closed = _close_truncated_json(chunk)
+            if closed is None:
+                continue
+            try:
+                data = json.loads(closed)
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                return data, False
+        if isinstance(data, dict):
+            return data, True
+    return {}, True
+
+
+def _repair_window(code: str, line: int) -> str:
+    """A numbered slice of the file around ``line`` with original line numbers."""
+    lines = code.splitlines()
+    start = max(1, line - WINDOW_RADIUS)
+    end = min(len(lines), line + WINDOW_RADIUS)
+    return "\n".join(f"{n:>4} | {lines[n - 1]}" for n in range(start, end + 1))
+
+
+def _apply_repair(code: str, line: int, replacement: str) -> Optional[str]:
+    """Put the model's line back into the file, keeping everything else byte-for-byte.
+
+    The replacement is re-indented to whatever the original line used, because a
+    model that drops the indentation produces an ``IndentationError`` for the
+    block it was repairing, and indentation is not the user's question.
+    """
+    lines = code.splitlines(keepends=True)
+    if not 1 <= line <= len(lines):
+        return None
+    text = lines[line - 1]
+    ending = text[len(text.rstrip("\r\n")) :]
+    indent = re.match(r"[ \t]*", text).group(0)
+    lines[line - 1] = indent + replacement.strip() + ending
+    return "".join(lines)
+
+
+def parse_repair_response(
+    text: str, code: str, analysis: Dict[str, Any]
+) -> Tuple[Optional[LocalRepair], str]:
+    """Turn one model answer into a repair, or explain why it cannot be one.
+
+    Pure function: no weights, no I/O, so every admission rule here can be
+    tested without loading the model. The answer must name the line it is
+    replacing *and* quote it, which is what stops a model from quietly editing
+    something it was never shown.
+    """
+    if not text or not text.strip():
+        return None, "the model returned nothing"
+
+    data, complete = _extract_json_object(text)
+    if not data:
+        return None, "the model did not return a JSON object"
+
+    if data.get("no_fix"):
+        why = str(data.get("reason") or "").strip() if complete else ""
+        return None, f"the model declined to guess: {why}" if why else "the model declined to guess"
+
+    try:
+        line = int(data["line"])
+    except (KeyError, TypeError, ValueError):
+        return None, "the answer did not name a line"
+
+    lines = code.splitlines(keepends=True)
+    if not 1 <= line <= len(lines):
+        return None, f"line {line} is not in the file"
+
+    reported = analysis.get("line") if isinstance(analysis, dict) else None
+    if isinstance(reported, int) and abs(line - reported) > UNTRUSTED_LINE_RADIUS:
+        # The validator would reject the candidate for this reason later; saying
+        # it here gives the panel the model's own wording instead of a gate's.
+        return None, (
+            f"it named line {line}, which is {abs(line - reported)} lines away from "
+            f"the reported line {reported}"
+        )
+
+    original = data.get("original")
+    replacement = data.get("replacement")
+    if not isinstance(original, str) or not isinstance(replacement, str):
+        return None, "the answer carried no original and replacement lines"
+
+    actual = lines[line - 1].rstrip("\r\n")
+    if original.rstrip() != actual.rstrip():
+        return None, (
+            f'it quoted line {line} as "{original.strip()}", which is not what is there'
+        )
+
+    candidate = replacement.strip()
+    if not candidate:
+        return None, "the replacement is empty"
+    if candidate.startswith("#"):
+        return None, "the replacement is a comment, which would delete what the line did"
+    if candidate == "pass":
+        return None, "the replacement is `pass`, which removes what the line did"
+    if len(candidate) > MAX_REPAIR_LENGTH:
+        return None, "the replacement is far longer than the line it replaces"
+    if candidate == actual.strip():
+        return None, "the replacement is what the line already says"
+
+    confidence = data.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return None, "the answer carried no confidence score"
+    if float(confidence) < MIN_CONFIDENCE:
+        return None, (
+            f"its confidence {float(confidence):.2f} is below {MIN_CONFIDENCE:.2f}"
+        )
+
+    applied = _apply_repair(code, line, candidate)
+    if applied is None or applied == code:
+        return None, "the replacement could not be placed in the file"
+
+    # The time budget can cut the answer inside the last field. The repair
+    # itself is intact, but a half-written reason is shown to the user, so it
+    # is dropped rather than quoted.
+    reason = str(data.get("reason") or "").strip() if complete else ""
+    if len(reason) < 8:
+        reason = ""
+
+    return (
+        LocalRepair(
+            line=line,
+            original=actual,
+            replacement=candidate,
+            reason=reason,
+            confidence=float(confidence),
+            code=applied,
+        ),
+        "",
+    )
+
+
 def model_status() -> Dict[str, Any]:
     return _ENGINE.status()
 
@@ -400,9 +649,18 @@ def explain_with_model(code: str, analysis: Dict[str, Any]) -> Optional[str]:
     return _ENGINE.explain(code, analysis)
 
 
+def propose_local_repair(
+    code: str, analysis: Dict[str, Any]
+) -> Tuple[Optional[LocalRepair], str]:
+    """One-line repair candidate plus the reason it is (or is not) usable."""
+    return _ENGINE.propose_repair(code, analysis)
+
+
 def propose_model_fix(code: str, analysis: Dict[str, Any]) -> Optional[str]:
-    """Unvalidated candidate. The caller must validate before presenting it."""
-    return _ENGINE.propose_fix(code, analysis)
+    """Full-file candidate text, *unvalidated*. Validate before presenting it."""
+    repair, _reason = _ENGINE.propose_repair(code, analysis)
+    return repair.code if repair else None
+
 
 
 def available_error_types() -> List[str]:

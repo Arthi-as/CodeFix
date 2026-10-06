@@ -640,6 +640,30 @@
   color: var(--success-text);
 }
 
+/* Repair status: what happened to the reported finding. Reuses .model-chip's
+   pill shape and only recolours it, so the three states read as one family. */
+.repair-chip {
+  margin-left: var(--space-sm);
+  vertical-align: middle;
+}
+
+.repair-chip.repair-fixed,
+.repair-chip.repair-clean {
+  border-color: var(--success-border);
+  color: var(--success-text);
+}
+
+.repair-chip.repair-ai {
+  border-color: var(--info-border);
+  color: var(--info-text);
+}
+
+.repair-chip.repair-none {
+  border-color: var(--warning-border);
+  color: var(--warning-text);
+}
+
+
 .kbd-hint {
   font-size: var(--font-size-xs);
   font-family: var(--font-mono);

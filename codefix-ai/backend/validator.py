@@ -61,6 +61,7 @@ class ValidationReport:
     changed: bool = False
     issue_resolved: Optional[bool] = None
     local: Optional[bool] = None
+    edit_lines: Optional[int] = None
     reason: str = ""
     warnings: List[str] = field(default_factory=list)
 
@@ -72,9 +73,11 @@ class ValidationReport:
             "changed": self.changed,
             "issue_resolved": self.issue_resolved,
             "local": self.local,
+            "edit_lines": self.edit_lines,
             "reason": self.reason,
             "warnings": self.warnings,
         }
+
 
 
 def check_syntax(code: str) -> tuple[bool, str]:
@@ -299,6 +302,10 @@ def validate_correction(
         report.reason = "No correction was produced, so there is nothing to validate."
         return report
     report.changed = True
+    # How big the edit is, measured rather than claimed: a repair that touches
+    # one line is what "minimal modification" means, and this number is what the
+    # panel shows for it.
+    report.edit_lines = len(changed_line_numbers(original, corrected))
 
     ok, detail = check_structure(corrected)
     if not ok:

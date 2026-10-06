@@ -516,6 +516,182 @@ def _fix_syntax_expected_colon(
     )
 
 
+_CLOSERS = {"(": ")", "[": "]", "{": "}"}
+_UNCLOSED_BRACKET = re.compile(r"'([(\[{])' was never closed")
+
+
+def _fix_syntax_unclosed_bracket(
+    code: str, tree: Optional[ast.AST], meta: Dict[str, Any], outcome: FixOutcome
+) -> Optional[str]:
+    """``print(1 + 2`` -> ``print(1 + 2)`` when a bracket was never closed.
+
+    The closing bracket cannot already have been written anywhere, so putting
+    the one the message names at the end of the file is a repair rather than a
+    guess about intent. Everything else has to be right too: if the candidate
+    does not parse - two open brackets, a closer landing inside a comment, a
+    bracket inside an unterminated string - nothing is offered.
+    """
+    line = meta.get("line")
+    msg = meta.get("syntax_msg") or ""
+    if line is None:
+        return None
+    match = _UNCLOSED_BRACKET.search(msg)
+    if not match:
+        return None
+    opener = match.group(1)
+    closer = _CLOSERS[opener]
+
+    lines = code.splitlines(keepends=True)
+    if not 1 <= line <= len(lines) or opener not in lines[line - 1]:
+        return None
+
+    last = len(lines) - 1
+    while last > 0 and not lines[last].strip():
+        last -= 1
+    ending = lines[last][len(lines[last].rstrip("\r\n")) :]
+    candidate = (
+        "".join(lines[:last])
+        + lines[last].rstrip("\r\n")
+        + closer
+        + ending
+        + "".join(lines[last + 1 :])
+    )
+    if candidate == code:
+        return None
+    try:
+        ast.parse(candidate)
+    except SyntaxError:
+        return None
+
+    outcome.applied = "unclosed-bracket"
+    outcome.summary = f"Closed the `{opener}` opened on line {line} with `{closer}` at the end of the file."
+    return candidate
+
+
+def _numeric_converter(node: ast.AST) -> Optional[str]:
+    """``int`` or ``float`` when ``node`` is a literal of that kind."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool):
+            return None
+        if isinstance(node.value, int):
+            return "int"
+        if isinstance(node.value, float):
+            return "float"
+    if isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant):
+        return _numeric_converter(node.operand)
+    return None
+
+
+def _used_as_text(tree: ast.AST, name: str) -> bool:
+    """True when ``name`` is used in a way that only works for a string.
+
+    Wrapping ``age = input()`` in ``int()`` fixes ``age + 10`` and turns
+    ``age.strip()`` into an ``AttributeError`` three lines down, so the
+    conversion is not offered while such a use exists.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            if node.value.id == name:
+                return True
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.value.id == name:
+                return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "len":
+                for arg in node.args:
+                    if isinstance(arg, ast.Name) and arg.id == name:
+                        return True
+        if isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+            if any(isinstance(op, ast.Name) and op.id == name for op in operands):
+                return any(
+                    isinstance(op, ast.Constant) and isinstance(op.value, str)
+                    for op in operands
+                )
+    return False
+
+
+def _fix_input_string_arithmetic(
+    code: str, tree: Optional[ast.AST], meta: Dict[str, Any], outcome: FixOutcome
+) -> Optional[str]:
+    """``age = input()`` + ``print(age + 10)`` -> ``age = int(input())``.
+
+    ``input()`` returns ``str``, so adding a number to it is the string/number
+    boundary the analyzer reports. Reading a number and adding ten to it is the
+    only reading of that line that keeps ``10`` a number: turning the ``+`` into
+    text concatenation would make the result ``"3610"``, which is not what the
+    programmer wrote either. So the input is converted - and only when the other
+    operand is a numeric literal, because only then is the intended type known,
+    and only when nothing else in the file needs the value to stay a string.
+    """
+    if tree is None or meta.get("binop") != "str-plus-number":
+        return None
+    if meta.get("template"):
+        return None  # a string literal is involved: the f-string fixer owns this
+    line = meta.get("line")
+    end_line = meta.get("end_line") or line
+    if line is None:
+        return None
+
+    targets: List[Tuple[str, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            if not line <= getattr(node, "lineno", 0) <= end_line:
+                continue
+            left_converter = _numeric_converter(node.left)
+            right_converter = _numeric_converter(node.right)
+            for other, converter in (
+                (node.right, left_converter),
+                (node.left, right_converter),
+            ):
+                if converter is None:
+                    continue
+                if not isinstance(other, ast.Name):
+                    continue
+                if _used_as_text(tree, other.id):
+                    return None
+                targets.append((other.id, converter))
+
+    if len(targets) != 1 or len({t[0] for t in targets}) != 1:
+        return None
+    name, converter = targets[0]
+
+    # Bind the conversion to the assignment that feeds this name, and only when
+    # there is exactly one such assignment to change.
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            child.parent = parent  # type: ignore[attr-defined]
+
+    calls = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and _is_input_call(node.value)
+        and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+    ]
+    if len(calls) != 1:
+        return None
+    call = calls[0]
+    if getattr(call, "parent", None) is None or not isinstance(call.parent, ast.Assign):
+        return None
+    assignment_line = call.parent.lineno
+
+    rewritten = _splice(code, _span(call)[0], _span(call)[1], f"{converter}({ast.unparse(call)})")
+    if rewritten == code:
+        return None
+    try:
+        ast.parse(rewritten)
+    except SyntaxError:
+        return None
+
+    outcome.applied = "input-string-arithmetic"
+    outcome.summary = (
+        f"Converted the value read on line {assignment_line} with `input()` to "
+        f"`{converter}()` so it can be added to a number."
+    )
+    return rewritten
+
+
 def _fix_str_number_concat(
     code: str, tree: Optional[ast.AST], meta: Dict[str, Any], outcome: FixOutcome
 ) -> Optional[str]:
@@ -643,17 +819,59 @@ def _fix_syntax_assignment_in_condition(
     return rewritten
 
 
+# Lines that must keep the block header's indentation. They are never pulled
+# into a block that happens to have been written above them unindented, because
+# doing so would silently change which statement belongs to which construct.
+_BLOCK_SIBLINGS = re.compile(
+    r"^[ \t]*(@|else|elif|except|finally|if|for|while|def|class|with|try|async)\b"
+)
+
+
+def _indent_unit(header_indent: str) -> str:
+    """One indentation step, in whatever the header already uses."""
+    return "\t" if "\t" in header_indent else "    "
+
+
+def _indent_run(lines: List[str], start: int, header_indent: str) -> List[int]:
+    """Indices of the consecutive unindented lines that belong to the block.
+
+    The run stops at a blank line, at a sibling block header, or at anything
+    indented differently - each of those is a place where the programmer's own
+    formatting says the block ended, and guessing past it restructures the file.
+    """
+    run: List[int] = []
+    for index in range(start, len(lines)):
+        text = lines[index]
+        if not text.strip():
+            break
+        if index > start and _BLOCK_SIBLINGS.match(text):
+            break
+        if re.match(r"[ \t]*", text).group(0) != header_indent:
+            break
+        run.append(index)
+    return run
+
+
+def _only_comments_after(lines: List[str], start: int) -> bool:
+    """True when nothing but comments follows line ``start`` (0-based)."""
+    return all(not text.strip() or text.lstrip().startswith("#") for text in lines[start:])
+
+
 def _fix_syntax_missing_indent(
     code: str, tree: Optional[ast.AST], meta: Dict[str, Any], outcome: FixOutcome
 ) -> Optional[str]:
-    """``def f():`` with no indented body -> insert an indented ``pass``.
+    """``if age > 18:\\nprint("Adult")`` -> indent the statement into the block.
 
     CPython reports the *offending* line (the unindented statement) while the
-    block header sits on the line named in the message, so the insertion point
-    comes from the message, not from ``line``.
+    block header sits on the line named in the message, so both are needed.
+
+    Indenting the statement is the repair. This fixer used to insert an
+    indented ``pass`` instead, which parses just as happily and leaves
+    ``print("Adult")`` running for every input rather than only for adults -
+    the code goes green and the bug survives.
     """
     line = meta.get("line")
-    msg = (meta.get("syntax_msg") or "")
+    msg = meta.get("syntax_msg") or ""
     if line is None or "expected an indented block" not in msg.lower():
         return None
 
@@ -662,29 +880,62 @@ def _fix_syntax_missing_indent(
     match = _HEADER_LINE_IN_MESSAGE.search(msg)
     if match:
         header_line = int(match.group(1))
-    if not 1 <= header_line <= len(lines):
+    if not 1 <= header_line <= len(lines) or not 1 <= line <= len(lines):
         return None
 
     header = lines[header_line - 1]
     body = header.rstrip("\r\n")
     if not body.rstrip().endswith(":"):
         return None
-    # Safe only when the next line is blank or unindented. If it is already
-    # indented then something else is wrong and inserting `pass` would hide it.
-    following = lines[header_line] if header_line < len(lines) else ""
-    if following.strip() and re.match(r"[ \t]", following):
+    header_indent = re.match(r"[ \t]*", body).group(0)
+
+    # Nothing follows the header, or only comments do: there is no statement to
+    # move, so an empty body really is the repair.
+    if header_line >= len(lines) or _only_comments_after(lines, line - 1):
+        inserted = header_indent + _indent_unit(header_indent) + "pass\n"
+        if header_line == len(lines) and not header.endswith("\n"):
+            inserted = "\n" + inserted
+        outcome.applied = "missing-indent"
+        outcome.summary = (
+            f"Line {header_line} opens a block with no body, so `pass` was added to it."
+        )
+        return "".join(lines[:header_line]) + inserted + "".join(lines[header_line:])
+
+    offender = lines[line - 1]
+    offender_indent = re.match(r"[ \t]*", offender).group(0)
+    # Only the plain case where the statement sits at the header's own level. A
+    # deeper or shallower indent is a mismatch between levels, and choosing
+    # which level the programmer meant restructures the program.
+    if offender_indent != header_indent:
         return None
 
-    indent = re.match(r"[ \t]*", body).group(0)
-    inserted = f"{indent}    pass\n"
-    if header_line == len(lines) and not header.endswith("\n"):
-        inserted = "\n" + inserted
+    run = _indent_run(lines, line - 1, header_indent)
+    if not run:
+        return None
 
+    unit = _indent_unit(header_indent)
+    patched = list(lines)
+    for index in run:
+        patched[index] = header_indent + unit + lines[index][len(header_indent) :]
+
+    candidate = "".join(patched)
+    if candidate == code:
+        return None
+    # The repair has to be a repair: if indenting the run still leaves a
+    # syntax error, the block boundary was not where this rule assumed.
+    try:
+        ast.parse(candidate)
+    except SyntaxError:
+        return None
+
+    first, last = run[0] + 1, run[-1] + 1
+    where = f"line {first}" if first == last else f"lines {first}-{last}"
     outcome.applied = "missing-indent"
     outcome.summary = (
-        f"Line {header_line} opens a block, so an indented `pass` was added to keep the file valid."
+        f"Indented {where} into the block opened on line {header_line}, which is "
+        "where the parser expected it."
     )
-    return "".join(lines[:header_line]) + inserted + "".join(lines[header_line:])
+    return candidate
 
 
 _PY2_PRINT = re.compile(r"^(\s*)print\s+(.+?)\s*$")
@@ -735,6 +986,11 @@ SEMANTIC_FIXERS: List[Tuple[Predicate, Fixer]] = [
         _fix_str_number_concat,
     ),
     (
+        lambda context: context.get("error_type") == "TypeError"
+        and context.get("binop") == "str-plus-number",
+        _fix_input_string_arithmetic,
+    ),
+    (
         lambda context: context.get("error_type") == "SingletonComparison",
         _fix_singleton_comparison,
     ),
@@ -756,6 +1012,10 @@ SYNTAX_FIXERS: List[Tuple[Predicate, Fixer]] = [
     (
         lambda context: "missing parentheses in call to 'print'" in (context.get("syntax_msg") or "").lower(),
         _fix_syntax_py2_print,
+    ),
+    (
+        lambda context: "was never closed" in (context.get("syntax_msg") or ""),
+        _fix_syntax_unclosed_bracket,
     ),
 ]
 

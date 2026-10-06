@@ -62,9 +62,23 @@ CASES = [
         "if x > 3:\n    print('a')",
     ),
     (
-        "indent pass for empty block",
+        # The unindented body belongs to the `def`, so it is indented into the
+        # block rather than being fenced off with `pass` - inserting `pass` and
+        # leaving `print('hi')` at the top level would change what the program
+        # does. An empty block still gets `pass` (see the EOF case below).
+        "indent the unindented body into the block",
         "def greet():\nprint('hi')",
-        "def greet():\n    pass\nprint('hi')",
+        "def greet():\n    print('hi')",
+    ),
+    (
+        "indent pass when the block is empty at end of file",
+        "def greet():",
+        "def greet():\n    pass\n",
+    ),
+    (
+        "indent an unindented body under a bare if",
+        "if x:\npass\n",
+        "if x:\n    pass\n",
     ),
     (
         "python 2 print statement",
